@@ -23,6 +23,6 @@ speedtest-cli
 spotipy
 tgcrypto
 unidecode
-yt-dlp==2025.09.26
 youtube-search
 youtube-search-python
+git+https://github.com/yt-dlp/yt-dlp.git
