@@ -1,79 +1,20 @@
+# Copyright (c) 2025 Nand Yaduwanshi <NoxxOP>
+# Modified to use pytubefix instead of yt-dlp
+
 import asyncio
 import os
 import re
-import json
 from typing import Union
-import glob
-import random
-import logging
-from http.cookiejar import MozillaCookieJar
 
-from pytube import YouTube, Playlist
-from pytube.extract import video_id
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from youtubesearchpython.__future__ import VideosSearch
+from pytubefix import YouTube, Playlist
+from pytubefix.cli import on_progress
 
 from ShrutixMusic.utils.database import is_on_off
 from ShrutixMusic.utils.formatters import time_to_seconds
 
-def cookie_txt_file():
-    folder_path = f"{os.getcwd()}/cookies"
-    filename = f"{os.getcwd()}/cookies/logs.csv"
-    txt_files = glob.glob(os.path.join(folder_path, '*.txt'))
-    if not txt_files:
-        raise FileNotFoundError("No .txt files found in the specified folder.")
-    cookie_txt_file = random.choice(txt_files)
-    with open(filename, 'a') as file:
-        file.write(f'Choosen File : {cookie_txt_file}\n')
-    return f"cookies/{str(cookie_txt_file).split('/')[-1]}"
-
-def get_yt_with_cookies(link):
-    """Get YouTube object with cookies"""
-    cookie_file = cookie_txt_file()
-    
-    # Create a cookie jar and load cookies
-    cookie_jar = MozillaCookieJar(cookie_file)
-    cookie_jar.load(ignore_discard=True, ignore_expires=True)
-    
-    # Create YouTube object with cookies
-    yt = YouTube(
-        link,
-        use_oauth=False,
-        allow_oauth_cache=True
-    )
-    
-    # Set cookies in the request handler
-    for cookie in cookie_jar:
-        yt._author.headers['Cookie'] = f"{cookie.name}={cookie.value}; {yt._author.headers.get('Cookie', '')}"
-    
-    return yt
-
-async def check_file_size(link):
-    try:
-        yt = get_yt_with_cookies(link)
-        # Get the highest resolution stream to check approximate size
-        stream = yt.streams.get_highest_resolution()
-        if stream:
-            return stream.filesize_approx
-    except Exception as e:
-        print(f"Error checking file size: {e}")
-        return None
-    return None
-
-async def shell_cmd(cmd):
-    proc = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, errorz = await proc.communicate()
-    if errorz:
-        if "unavailable videos are hidden" in (errorz.decode("utf-8")).lower():
-            return out.decode("utf-8")
-        else:
-            return errorz.decode("utf-8")
-    return out.decode("utf-8")
 
 class YouTubeAPI:
     def __init__(self):
@@ -169,17 +110,21 @@ class YouTubeAPI:
             link = link.split("&")[0]
         
         try:
-            yt = get_yt_with_cookies(link)
-            # Get the best progressive stream (video + audio)
-            stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
-            if stream:
-                return 1, stream.url
+            loop = asyncio.get_running_loop()
+            
+            def get_video_url():
+                yt = YouTube(link, on_progress_callback=on_progress)
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+                if stream:
+                    return stream.url
+                return None
+            
+            video_url = await loop.run_in_executor(None, get_video_url)
+            if video_url:
+                return 1, video_url
             else:
-                # If no progressive stream, get best video stream
-                video_stream = yt.streams.filter(adaptive=True, file_extension='mp4', only_video=True).order_by('resolution').desc().first()
-                return 1, video_stream.url if video_stream else None
+                return 0, "No suitable stream found"
         except Exception as e:
-            print(f"Error in video method: {e}")
             return 0, str(e)
 
     async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
@@ -189,26 +134,21 @@ class YouTubeAPI:
             link = link.split("&")[0]
         
         try:
-            # PyTube Playlist doesn't directly support cookies, so we'll use a workaround
-            pl = Playlist(link)
-            video_urls = []
-            count = 0
+            loop = asyncio.get_running_loop()
             
-            for video_url in pl.video_urls:
-                if count >= limit:
-                    break
-                try:
-                    # Extract video ID from URL
-                    vid_id = video_url.split('v=')[1].split('&')[0]
-                    video_urls.append(vid_id)
-                    count += 1
-                except Exception as e:
-                    print(f"Error processing video URL: {e}")
-                    continue
-                    
-            return video_urls
+            def get_playlist_videos():
+                pl = Playlist(link)
+                video_ids = []
+                for i, video in enumerate(pl.videos):
+                    if i >= limit:
+                        break
+                    video_ids.append(video.video_id)
+                return video_ids
+            
+            result = await loop.run_in_executor(None, get_playlist_videos)
+            return result
         except Exception as e:
-            print(f"Error getting playlist: {e}")
+            print(f"Playlist error: {e}")
             return []
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
@@ -239,45 +179,28 @@ class YouTubeAPI:
             link = link.split("&")[0]
         
         try:
-            yt = get_yt_with_cookies(link)
-            formats_available = []
+            loop = asyncio.get_running_loop()
             
-            # Progressive streams (video + audio)
-            for stream in yt.streams.filter(progressive=True):
-                formats_available.append({
-                    "format": f"{stream.resolution} (progressive)",
-                    "filesize": stream.filesize_approx,
-                    "format_id": stream.itag,
-                    "ext": stream.mime_type.split('/')[-1],
-                    "format_note": "video+audio",
-                    "yturl": link,
-                })
-            
-            # Adaptive video streams
-            for stream in yt.streams.filter(adaptive=True, only_video=True):
-                formats_available.append({
-                    "format": f"{stream.resolution} (video only)",
-                    "filesize": stream.filesize_approx,
-                    "format_id": stream.itag,
-                    "ext": stream.mime_type.split('/')[-1],
-                    "format_note": "video only",
-                    "yturl": link,
-                })
-            
-            # Audio streams
-            for stream in yt.streams.filter(only_audio=True):
-                formats_available.append({
-                    "format": f"audio ({stream.abr})",
-                    "filesize": stream.filesize_approx,
-                    "format_id": stream.itag,
-                    "ext": stream.mime_type.split('/')[-1],
-                    "format_note": "audio only",
-                    "yturl": link,
-                })
+            def get_formats():
+                yt = YouTube(link)
+                formats_available = []
                 
+                for stream in yt.streams.filter(progressive=True):
+                    formats_available.append({
+                        "format": f"{stream.resolution} - {stream.mime_type}",
+                        "filesize": stream.filesize or 0,
+                        "format_id": stream.itag,
+                        "ext": stream.subtype,
+                        "format_note": stream.resolution or "audio only",
+                        "yturl": link,
+                    })
+                
+                return formats_available
+            
+            formats_available = await loop.run_in_executor(None, get_formats)
             return formats_available, link
         except Exception as e:
-            print(f"Error getting formats: {e}")
+            print(f"Formats error: {e}")
             return [], link
 
     async def slider(
@@ -313,133 +236,123 @@ class YouTubeAPI:
             link = self.base + link
         
         loop = asyncio.get_running_loop()
-
+        
         def audio_dl():
             try:
-                yt = get_yt_with_cookies(link)
-                # Get the best audio stream
+                yt = YouTube(link, on_progress_callback=on_progress)
                 audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-                if audio_stream:
-                    # Download audio
-                    output_file = audio_stream.download(
-                        output_path="downloads", 
-                        filename=f"{yt.video_id}"
-                    )
-                    # Rename to mp3 if needed
-                    if not output_file.endswith('.mp3'):
-                        base, ext = os.path.splitext(output_file)
-                        new_file = base + '.mp3'
-                        os.rename(output_file, new_file)
-                        return new_file
-                    return output_file
+                
+                if not audio_stream:
+                    return None
+                
+                filename = f"downloads/{yt.video_id}.{audio_stream.subtype}"
+                
+                if os.path.exists(filename):
+                    return filename
+                
+                audio_stream.download(output_path="downloads", filename=f"{yt.video_id}.{audio_stream.subtype}")
+                return filename
             except Exception as e:
-                print(f"Error in audio download: {e}")
+                print(f"Audio download error: {e}")
                 return None
 
         def video_dl():
             try:
-                yt = get_yt_with_cookies(link)
-                # Get the best progressive stream (video + audio)
-                stream = yt.streams.filter(
-                    progressive=True, 
-                    file_extension='mp4'
-                ).order_by('resolution').desc().first()
+                yt = YouTube(link, on_progress_callback=on_progress)
+                video_stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
                 
-                if stream:
-                    output_file = stream.download(
-                        output_path="downloads", 
-                        filename=f"{yt.video_id}"
-                    )
-                    return output_file
-                else:
-                    # Fallback to adaptive streams
-                    stream = yt.streams.filter(
-                        adaptive=True, 
-                        file_extension='mp4'
-                    ).order_by('resolution').desc().first()
-                    if stream:
-                        output_file = stream.download(
-                            output_path="downloads", 
-                            filename=f"{yt.video_id}"
-                        )
-                        return output_file
+                if not video_stream:
+                    video_stream = yt.streams.filter(file_extension='mp4').first()
+                
+                if not video_stream:
+                    return None
+                
+                filename = f"downloads/{yt.video_id}.mp4"
+                
+                if os.path.exists(filename):
+                    return filename
+                
+                video_stream.download(output_path="downloads", filename=f"{yt.video_id}.mp4")
+                return filename
             except Exception as e:
-                print(f"Error in video download: {e}")
+                print(f"Video download error: {e}")
                 return None
 
         def song_video_dl():
             try:
-                yt = get_yt_with_cookies(link)
-                # Get stream by itag (format_id)
-                stream = yt.streams.get_by_itag(int(format_id))
+                yt = YouTube(link, on_progress_callback=on_progress)
+                stream = yt.streams.get_by_itag(format_id)
+                
+                if not stream:
+                    stream = yt.streams.filter(progressive=True).first()
+                
                 if stream:
-                    output_file = stream.download(
-                        output_path="downloads", 
-                        filename=title
-                    )
-                    return output_file
+                    fpath = f"downloads/{title}.mp4"
+                    stream.download(output_path="downloads", filename=f"{title}.mp4")
+                    return fpath
             except Exception as e:
-                print(f"Error in song video download: {e}")
+                print(f"Song video download error: {e}")
                 return None
 
         def song_audio_dl():
             try:
-                yt = get_yt_with_cookies(link)
-                # Get audio stream by itag
-                stream = yt.streams.get_by_itag(int(format_id))
+                yt = YouTube(link, on_progress_callback=on_progress)
+                
+                if format_id:
+                    stream = yt.streams.get_by_itag(format_id)
+                else:
+                    stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                
                 if stream:
-                    output_file = stream.download(
-                        output_path="downloads", 
-                        filename=title
-                    )
+                    fpath = f"downloads/{title}"
+                    stream.download(output_path="downloads", filename=title)
+                    
                     # Convert to mp3 if needed
-                    if not output_file.endswith('.mp3'):
-                        base, ext = os.path.splitext(output_file)
-                        new_file = base + '.mp3'
-                        os.rename(output_file, new_file)
-                        return new_file
-                    return output_file
+                    downloaded_file = f"downloads/{title}.{stream.subtype}"
+                    mp3_file = f"downloads/{title}.mp3"
+                    
+                    if os.path.exists(downloaded_file) and downloaded_file != mp3_file:
+                        # You'll need ffmpeg for conversion
+                        import subprocess
+                        subprocess.run(['ffmpeg', '-i', downloaded_file, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', mp3_file])
+                        os.remove(downloaded_file)
+                    
+                    return mp3_file
             except Exception as e:
-                print(f"Error in song audio download: {e}")
+                print(f"Song audio download error: {e}")
                 return None
 
         if songvideo:
-            downloaded_file = await loop.run_in_executor(None, song_video_dl)
-            return downloaded_file, True
+            fpath = await loop.run_in_executor(None, song_video_dl)
+            return fpath
         elif songaudio:
-            downloaded_file = await loop.run_in_executor(None, song_audio_dl)
-            return downloaded_file, True
+            fpath = await loop.run_in_executor(None, song_audio_dl)
+            return fpath
         elif video:
             if await is_on_off(1):
                 direct = True
                 downloaded_file = await loop.run_in_executor(None, video_dl)
             else:
+                # Try to get direct URL first
                 try:
-                    yt = get_yt_with_cookies(link)
-                    stream = yt.streams.filter(
-                        progressive=True, 
-                        file_extension='mp4'
-                    ).order_by('resolution').desc().first()
+                    yt = YouTube(link)
+                    stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
                     
-                    if stream:
+                    if stream and stream.filesize and stream.filesize / (1024 * 1024) <= 250:
                         downloaded_file = stream.url
                         direct = False
                     else:
-                        file_size = await check_file_size(link)
-                        if not file_size:
-                            print("None file Size")
-                            return None, None
-                        total_size_mb = file_size / (1024 * 1024)
-                        if total_size_mb > 250:
-                            print(f"File size {total_size_mb:.2f} MB exceeds the 250MB limit.")
-                            return None, None
                         direct = True
                         downloaded_file = await loop.run_in_executor(None, video_dl)
-                except Exception as e:
-                    print(f"Error: {e}")
-                    return None, None
+                except:
+                    direct = True
+                    downloaded_file = await loop.run_in_executor(None, video_dl)
         else:
             direct = True
             downloaded_file = await loop.run_in_executor(None, audio_dl)
         
         return downloaded_file, direct
+
+
+# ©️ Copyright Reserved - @NoxxOP  Nand Yaduwanshi
+# Modified to use pytubefix for better reliability
